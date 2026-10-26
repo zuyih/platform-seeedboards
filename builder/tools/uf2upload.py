@@ -214,6 +214,24 @@ def _classify_open_error(exc):
     return str(exc)
 
 
+def _discard_and_close(s):
+    """Close a trigger port without waiting for queued output to drain.
+
+    A freshly enumerated POSIX tty starts with echo enabled, and the
+    application's CDC output (released when DTR rises on open) arrives
+    before pyserial switches the port to raw mode. That output is echoed
+    back to the device; firmware that never reads its CDC OUT endpoint
+    leaves the echo stuck, and close() then blocks for the port's
+    closing_wait (30 s by default). Nothing queued here is meant to be
+    delivered, so drop it first.
+    """
+    try:
+        s.reset_output_buffer()
+    except Exception:
+        pass
+    s.close()
+
+
 def open_close_port(port, baudrate):
     """Open and close a serial port briefly, changing its line coding.
 
@@ -227,7 +245,7 @@ def open_close_port(port, baudrate):
     except Exception as exc:
         return _classify_open_error(exc)
     try:
-        s.close()
+        _discard_and_close(s)
     except Exception:
         pass
     return None
@@ -288,7 +306,7 @@ def trigger_bootloader_1200baud(port):
         # detaching device.
         s = serial.Serial(port, 1200)
         time.sleep(0.1)
-        s.close()
+        _discard_and_close(s)
         return True, None
     except Exception:
         # Device detached mid-touch (or right after): the trigger almost
@@ -320,7 +338,7 @@ def trigger_bootloader_dtr_double_tap(port):
         time.sleep(0.05)
         s.dtr = True
         time.sleep(0.1)
-        s.close()
+        _discard_and_close(s)
         return True, None
     except Exception as exc:
         return False, _classify_open_error(exc)

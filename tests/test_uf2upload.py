@@ -1,7 +1,8 @@
 """Unit tests for the generic UF2 uploader (builder/tools/uf2upload.py).
 
-Covers the trigger-port policy (never guess an unrelated serial port) and
-the Linux mount fallback for systems without a desktop automounter.
+Covers the trigger-port policy (never guess an unrelated serial port), the
+Linux mount fallback for systems without a desktop automounter, and closing
+trigger ports without waiting on stuck echo output.
 """
 
 import argparse
@@ -61,6 +62,36 @@ def test_unrelated_serial_bridge_is_never_touched(comports):
 def test_no_port_and_no_hwid_skips_trigger(comports):
     comports(("/dev/ttyUSB9", 0x1A86, 0x7523))
     assert uf2upload.resolve_trigger_port(None, []) is None
+
+
+class _FakeSerial:
+    def __init__(self, calls, flush_error=None):
+        self.calls = calls
+        self.flush_error = flush_error
+
+    def reset_output_buffer(self):
+        self.calls.append("reset_output_buffer")
+        if self.flush_error:
+            raise self.flush_error
+
+    def close(self):
+        self.calls.append("close")
+
+
+def test_trigger_port_output_is_discarded_before_close(monkeypatch):
+    # Queued echo must not make close() wait for closing_wait (30 s).
+    calls = []
+    monkeypatch.setattr("serial.Serial", lambda port, baud: _FakeSerial(calls))
+    assert uf2upload.open_close_port("/dev/ttyACM17", 9600) is None
+    assert calls == ["reset_output_buffer", "close"]
+
+
+def test_port_is_closed_even_if_discard_fails(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "serial.Serial", lambda port, baud: _FakeSerial(calls, OSError("EIO")))
+    assert uf2upload.open_close_port("/dev/ttyACM17", 9600) is None
+    assert calls == ["reset_output_buffer", "close"]
 
 
 def test_unmounted_drive_is_mounted_with_udisksctl(monkeypatch):
