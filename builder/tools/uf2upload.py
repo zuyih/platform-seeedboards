@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import errno
+import shutil
 import argparse
 import subprocess
 import platform
@@ -25,11 +26,77 @@ UF2_VOLUME_LABEL = "XIAOC5BOOT"
 UF2_DRIVE_TIMEOUT = 30  # seconds to wait for drive to appear
 SERIAL_BUSY_TIMEOUT = 60  # seconds to wait for a busy serial port to be released
 
+_reported_mount_failures = set()
+
 
 def set_volume_label(label):
     """Override the default volume label for UF2 drive detection."""
     global UF2_VOLUME_LABEL
     UF2_VOLUME_LABEL = label
+
+
+def _linux_mountpoint(dev):
+    """Return the first mount point of a block device, or None."""
+    try:
+        result = subprocess.run(
+            ["lsblk", "-no", "MOUNTPOINT", dev],
+            capture_output=True, text=True, timeout=5
+        )
+    except Exception:
+        return None
+    for mount in result.stdout.splitlines():
+        mount = mount.strip()
+        if mount and os.path.isdir(mount):
+            return mount
+    return None
+
+
+def _mount_linux(dev):
+    """Mount a block device and return its mount point, or None.
+
+    Systems without a desktop automounter leave the bootloader drive
+    unmounted. udisks2 lets an unprivileged user mount removable media,
+    so it is tried first; a plain mount(8) needs root and is only tried
+    as root. A failure is reported once per device instead of silently
+    timing out the drive wait.
+    """
+    errors = []
+    if shutil.which("udisksctl"):
+        try:
+            result = subprocess.run(
+                ["udisksctl", "mount", "-b", dev, "--no-user-interaction"],
+                capture_output=True, text=True, timeout=15
+            )
+            mount = _linux_mountpoint(dev)
+            if mount:
+                return mount
+            errors.append("udisksctl: " + (result.stderr or result.stdout).strip())
+        except Exception as exc:
+            errors.append(f"udisksctl: {exc}")
+    else:
+        errors.append("udisksctl not found")
+
+    if os.geteuid() == 0:
+        mnt = "/mnt/uf2_upload"
+        try:
+            os.makedirs(mnt, exist_ok=True)
+            result = subprocess.run(["mount", dev, mnt],
+                                    capture_output=True, text=True, timeout=10)
+            if os.path.ismount(mnt):
+                return mnt
+            errors.append("mount: " + result.stderr.strip())
+        except Exception as exc:
+            errors.append(f"mount: {exc}")
+
+    if dev not in _reported_mount_failures:
+        _reported_mount_failures.add(dev)
+        print(f"\n  Found '{UF2_VOLUME_LABEL}' at {dev}, but it is not mounted "
+              f"and could not be mounted:")
+        for error in errors:
+            print(f"    {error}")
+        print(f"  Mount it manually (e.g. 'udisksctl mount -b {dev}') "
+              f"while this upload is waiting.")
+    return None
 
 
 def _find_uf2_drive_linux():
@@ -40,27 +107,9 @@ def _find_uf2_drive_linux():
         for entry in os.listdir(by_label):
             if entry.upper() == UF2_VOLUME_LABEL.upper():
                 dev = os.path.realpath(os.path.join(by_label, entry))
-                # Find mount point
-                try:
-                    result = subprocess.run(
-                        ["lsblk", "-no", "MOUNTPOINT", dev],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    mount = result.stdout.strip()
-                    if mount and os.path.isdir(mount):
-                        return mount
-                except Exception:
-                    pass
-                # Try to mount
-                mnt = "/mnt/uf2_upload"
-                try:
-                    os.makedirs(mnt, exist_ok=True)
-                    subprocess.run(["mount", dev, mnt], capture_output=True, timeout=10)
-                    time.sleep(0.5)
-                    if os.path.ismount(mnt):
-                        return mnt
-                except Exception:
-                    pass
+                mount = _linux_mountpoint(dev) or _mount_linux(dev)
+                if mount:
+                    return mount
 
     # Method 2: lsblk
     try:
@@ -399,13 +448,43 @@ def write_uf2_cmd(uf2_path, drive_path):
 # Main upload flow
 # ---------------------------------------------------------------------------
 
-def upload_uf2(uf2_path, serial_port=None, timeout=UF2_DRIVE_TIMEOUT):
+def resolve_trigger_port(serial_port, hwids):
+    """Pick the serial port to send the bootloader trigger to, or None.
+
+    An explicit port is used as given. Otherwise only a port whose USB
+    VID:PID matches one of ``hwids`` is eligible: touching or toggling
+    DTR on an unrelated serial device can reset whatever board is
+    attached to it, so no port is ever guessed.
+    """
+    if serial_port:
+        return serial_port
+    if not hwids:
+        print("  No serial port or board VID:PID given; skipping the "
+              "bootloader trigger.")
+        return None
+    ports = _find_ports_by_hwid(hwids)
+    wanted = ", ".join(f"{vid:04X}:{pid:04X}" for vid, pid in hwids)
+    if not ports:
+        print(f"  No serial port with VID:PID {wanted} found "
+              f"(the board may already be in bootloader mode).")
+        return None
+    if len(ports) > 1:
+        print(f"  Several serial ports match VID:PID {wanted}: "
+              f"{', '.join(ports)}; using {ports[0]}.")
+        print("  Set upload_port to select a specific board.")
+    return ports[0]
+
+
+def upload_uf2(uf2_path, serial_port=None, timeout=UF2_DRIVE_TIMEOUT,
+               hwids=None):
     """Complete UF2 upload flow.
 
     Args:
         uf2_path: path to .uf2 firmware file
         serial_port: optional serial port for bootloader trigger
         timeout: seconds to wait for UF2 drive
+        hwids: (vid, pid) tuples used to find the trigger port when
+            serial_port is not given
 
     Returns:
         True on success, False on failure
@@ -424,6 +503,7 @@ def upload_uf2(uf2_path, serial_port=None, timeout=UF2_DRIVE_TIMEOUT):
         print(f"  Found UF2 drive: {drive}")
     else:
         # Step 2: Try serial trigger
+        serial_port = resolve_trigger_port(serial_port, hwids)
         if serial_port:
             print(f"  Triggering bootloader via {serial_port}...")
             _, reason = trigger_bootloader(serial_port)
@@ -436,10 +516,6 @@ def upload_uf2(uf2_path, serial_port=None, timeout=UF2_DRIVE_TIMEOUT):
                 # Reason and remedy were printed by trigger_bootloader;
                 # waiting cannot fix a permissions problem.
                 return False
-        else:
-            print("  Attempting serial bootloader trigger...")
-            for candidate in _detect_serial_ports():
-                trigger_bootloader(candidate)
 
         # Step 3: Wait for drive
         print(f"  Waiting for UF2 drive (double-tap RESET if needed, "
@@ -478,30 +554,23 @@ def upload_uf2(uf2_path, serial_port=None, timeout=UF2_DRIVE_TIMEOUT):
     return False
 
 
-def _detect_serial_ports():
-    """Auto-detect available serial ports."""
-    ports = []
+def _find_ports_by_hwid(hwids):
+    """Return serial ports whose USB VID:PID is in ``hwids``, sorted."""
+    import serial.tools.list_ports
+    return sorted(
+        info.device for info in serial.tools.list_ports.comports()
+        if (info.vid, info.pid) in hwids
+    )
+
+
+def _parse_hwid(value):
+    """Parse a "VID:PID" string (hex, optional 0x prefix) into a tuple."""
     try:
-        import serial.tools.list_ports
-        for info in serial.tools.list_ports.comports():
-            ports.append(info.device)
-    except Exception:
-        if platform.system() == "Linux":
-            for p in ["/dev/ttyACM0", "/dev/ttyACM1",
-                      "/dev/ttyUSB0", "/dev/ttyUSB1"]:
-                if os.path.exists(p):
-                    ports.append(p)
-        elif platform.system() == "Windows":
-            for i in range(256):
-                candidate = f"COM{i}"
-                try:
-                    import serial
-                    s = serial.Serial(candidate)
-                    s.close()
-                    ports.append(candidate)
-                except Exception:
-                    pass
-    return ports
+        vid, pid = value.split(":")
+        return int(vid, 16), int(pid, 16)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"invalid VID:PID '{value}' (expected e.g. 0x2886:0x00C5)")
 
 
 def main():
@@ -523,6 +592,12 @@ def main():
         help="Serial port for bootloader trigger"
     )
     parser.add_argument(
+        "--hwid", action="append", type=_parse_hwid, default=[],
+        metavar="VID:PID",
+        help="USB VID:PID of the board's application serial port, used to "
+             "find the trigger port when --port is not given (repeatable)"
+    )
+    parser.add_argument(
         "--label", default=None,
         help="Volume label of UF2 drive (default: XIAOC5BOOT)"
     )
@@ -541,16 +616,14 @@ def main():
         set_volume_label(args.label)
 
     if args.trigger_only:
-        if args.port:
-            print(f"Triggering bootloader via {args.port}...")
-            trigger_bootloader(args.port)
-        else:
-            for port in _detect_serial_ports():
-                print(f"Trying {port}...")
-                trigger_bootloader(port)
+        port = resolve_trigger_port(args.port, args.hwid)
+        if port:
+            print(f"Triggering bootloader via {port}...")
+            trigger_bootloader(port)
         return
 
-    success = upload_uf2(args.uf2_file, args.port or None, args.timeout)
+    success = upload_uf2(args.uf2_file, args.port or None, args.timeout,
+                         args.hwid)
     sys.exit(0 if success else 1)
 
 

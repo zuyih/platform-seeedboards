@@ -109,13 +109,22 @@ target_buildprog = env.Alias("buildprog", target_buildprog_sources)
 if upload_protocol == "uf2":
     tools_dir = join(platform.get_dir(), "builder", "tools")
     volume_label = uf2_config.get("volume_label", "XIAOC5BOOT")
+    hwid_flags = "".join(
+        " --hwid %s:%s" % (vid, pid) for vid, pid in board.get("build.hwids", [])
+    )
     env.Replace(
-        UPLOADCMD='"$PYTHONEXE" "%s" "$SOURCE" --label %s --port "${UPLOAD_PORT}"'
-        % (join(tools_dir, "uf2upload.py"), volume_label),
+        UPLOADCMD='"$PYTHONEXE" "%s" "$SOURCE" --label %s%s --port "${UPLOAD_PORT}"'
+        % (join(tools_dir, "uf2upload.py"), volume_label, hwid_flags),
     )
 
     def before_uf2_upload(target, source, env):  # pylint: disable=unused-argument
-        env.AutodetectUploadPort()
+        # Without an explicit upload_port, uf2upload.py picks the trigger
+        # port by the board's VID:PID. PlatformIO's generic autodetection
+        # falls back to any known USB-serial bridge when the board is not
+        # enumerated as CDC (e.g. already in the bootloader), and touching
+        # such an unrelated port can reset another attached board.
+        if env.subst("$UPLOAD_PORT"):
+            env.AutodetectUploadPort()
         # The 1200-bps bootloader touch happens inside the uf2upload.py
         # subprocess, which detects and reports a port held open by a
         # serial monitor. Touching here too would use PlatformIO's
