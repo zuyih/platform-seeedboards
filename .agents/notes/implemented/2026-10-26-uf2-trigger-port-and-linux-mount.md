@@ -34,6 +34,14 @@ serial port on the system.
   underlying errors and a manual-mount hint.
 - `uf2upload.py` stays chip-agnostic: the VID:PID values come from board
   metadata through the builder, not from tables in `builder/tools/`.
+- Trigger ports are closed after discarding queued output
+  (`reset_output_buffer()`). A freshly enumerated Linux tty starts with
+  `ECHO`, so CDC output the application releases when DTR rises is echoed
+  back before pyserial selects raw mode; firmware that never reads its CDC
+  OUT endpoint (e.g. a console-only Zephyr app) leaves that echo queued, and
+  `close()` blocked for the tty_port default `closing_wait` of 30 s. This is
+  generic Linux tty/cdc-acm behavior, not distribution or kernel-config
+  specific.
 
 ## Alternatives considered
 
